@@ -164,11 +164,17 @@ SIGNUP_ENABLED = False
 OFFLINE_MODE = False
 RECORDS_ALLOW_EDIT = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'SOA', 'SRV', 'TXT', 'CAA', 'TLSA', 'SSHFP', 'LOC', 'NAPTR', 'ALIAS']
 
-# Session
+# Session — filesystem type required by flask_session_captcha to prevent replay attacks
+SESSION_TYPE = 'filesystem'
+SESSION_FILE_DIR = '${INSTALL_DIR}/data/flask_sessions'
+SESSION_PERMANENT = False
 SESSION_COOKIE_SAMESITE = 'Lax'
+
+# Captcha (disable to avoid requiring Redis/Memcached)
+CAPTCHA_ENABLE = False
 PYEOF
 
-mkdir -p "$INSTALL_DIR/data"
+mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/data/flask_sessions"
 ok "App configured"
 
 # ── Build frontend assets ─────────────────────────────────────────────────────
@@ -263,7 +269,11 @@ EOF
 # Some setups (e.g., pure-proxy dns servers) omit the standard conf.d glob.
 if ! grep -q 'conf\.d/\*\.conf\|conf\.d/pdns-admin' /etc/nginx/nginx.conf 2>/dev/null; then
     warn "nginx.conf does not include conf.d — adding explicit include"
-    sed -i "s|include[[:space:]]*/etc/nginx/mime\.types;|include /etc/nginx/mime.types;\n    include ${NGINX_CONF};|" /etc/nginx/nginx.conf
+    # Use awk to insert the include line after mime.types (sed \n is not portable)
+    awk -v conf="$NGINX_CONF" '
+        /include.*mime\.types/ { print; print "    include " conf ";"; next }
+        { print }
+    ' /etc/nginx/nginx.conf > /tmp/nginx.conf.tmp && mv /tmp/nginx.conf.tmp /etc/nginx/nginx.conf
 fi
 
 nginx -t 2>/dev/null && nginx -s reload && ok "nginx configured (port ${APP_PORT} → gunicorn :${GUNICORN_PORT})" \
