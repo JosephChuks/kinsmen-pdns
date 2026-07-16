@@ -118,6 +118,7 @@ CLEANED_REQ=$(mktemp)
 # headers; we use SQLite so it's unused).
 grep -v '^--' "$INSTALL_DIR/requirements.txt" \
     | grep -v '^mysqlclient' \
+    | grep -v '^psycopg2' \
     > "$CLEANED_REQ" || cp "$INSTALL_DIR/requirements.txt" "$CLEANED_REQ"
 
 # Install app dependencies
