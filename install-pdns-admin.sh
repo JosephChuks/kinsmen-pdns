@@ -185,9 +185,20 @@ ok "App configured"
 info "Building frontend assets (this may take a minute)..."
 cd "$INSTALL_DIR"
 if command -v yarn &>/dev/null; then
-    yarn install --silent 2>/dev/null && yarn build 2>/dev/null && ok "Assets built with yarn" || warn "yarn build had warnings — app may still work"
+    yarn install 2>&1 | tail -5
+    yarn build 2>&1 | tail -10
 else
-    npm install --silent 2>/dev/null && npm run build 2>/dev/null && ok "Assets built with npm" || warn "npm build had warnings"
+    npm install 2>&1 | tail -5
+    npm run build 2>&1 | tail -10
+fi
+
+# Verify critical asset exists — abort if build failed
+if [[ ! -f "$INSTALL_DIR/powerdnsadmin/static/generated/main.js" ]] && \
+   [[ ! -f "$INSTALL_DIR/powerdnsadmin/static/node_modules/@fortawesome/fontawesome-free/css/all.css" ]]; then
+    warn "Frontend build may be incomplete — checking for any generated assets..."
+    ls "$INSTALL_DIR/powerdnsadmin/static/generated/" 2>/dev/null || warn "No generated assets found — run 'cd $INSTALL_DIR && yarn build' manually"
+else
+    ok "Frontend assets built"
 fi
 
 # ── Database init ─────────────────────────────────────────────────────────────
