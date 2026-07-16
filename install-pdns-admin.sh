@@ -65,6 +65,16 @@ info "Installing system dependencies..."
 # Prefer python3.9 (available on EL8 via appstream); python3 on EL8 is 3.6 which
 # is too old for PowerDNS-Admin and has a pip that lacks required features.
 dnf install -y -q python39 python39-devel python39-pip 2>/dev/null || true
+
+# Node 18+ required by PowerDNS-Admin's frontend deps (fs-extra requires >=12,
+# default EL8 stream is Node 10). Switch module stream before installing.
+NODE_VER=$(node --version 2>/dev/null | grep -oP '\d+' | head -1)
+if [[ -z "$NODE_VER" || "$NODE_VER" -lt 18 ]]; then
+    info "Upgrading Node.js to 18 (current: ${NODE_VER:-none})..."
+    dnf module reset nodejs -y -q 2>/dev/null || true
+    dnf module enable nodejs:18 -y -q 2>/dev/null || true
+fi
+
 dnf install -y -q \
     gcc gcc-c++ make \
     openssl-devel libffi-devel libxml2-devel libxslt-devel \
@@ -80,7 +90,7 @@ dnf install -y -q \
 
 # yarn via npm
 npm install -g yarn --quiet 2>/dev/null || true
-ok "Dependencies installed"
+ok "Dependencies installed (Node $(node --version 2>/dev/null))"
 
 # ── Service user ──────────────────────────────────────────────────────────────
 
