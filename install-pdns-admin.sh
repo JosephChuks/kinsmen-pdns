@@ -46,7 +46,7 @@ fi
 [[ $EUID -eq 0 ]] || die "Run as root"
 command -v pdns_server >/dev/null 2>&1 || die "PowerDNS not found — install it first"
 
-PDNS_API_KEY=$(grep '^api-key' /etc/pdns/pdns.conf 2>/dev/null | cut -d= -f2 | tr -d ' ')
+PDNS_API_KEY=$(grep '^api-key' /etc/pdns/pdns.conf 2>/dev/null | cut -d= -f2 | tr -d ' ') || true
 PDNS_API_URL="http://localhost:8081/api/v1"
 
 [[ -n "$PDNS_API_KEY" ]] || die "api-key not set in /etc/pdns/pdns.conf"
