@@ -16,7 +16,8 @@ set -euo pipefail
 INSTALL_DIR="/opt/pdns-admin"
 SERVICE_USER="pdnsadmin"
 SERVICE_FILE="/etc/systemd/system/pdns-admin.service"
-APP_PORT=9191
+APP_PORT=9191       # external port (nginx listens here)
+GUNICORN_PORT=9292  # internal port (gunicorn binds here, avoids self-proxy loop)
 NGINX_CONF="/etc/nginx/conf.d/pdns-admin.conf"
 SECRET_FILE="/etc/pdns-admin.secret"
 
@@ -215,7 +216,7 @@ Environment="FLASK_APP=powerdnsadmin/__init__.py"
 Environment="FLASK_ENV=production"
 ExecStart=${INSTALL_DIR}/venv/bin/gunicorn \
     --workers 2 \
-    --bind 127.0.0.1:${APP_PORT} \
+    --bind 127.0.0.1:${GUNICORN_PORT} \
     --timeout 120 \
     --access-logfile ${INSTALL_DIR}/data/access.log \
     --error-logfile ${INSTALL_DIR}/data/error.log \
@@ -236,18 +237,19 @@ ok "Service started"
 # ── Nginx reverse proxy ───────────────────────────────────────────────────────
 
 info "Configuring nginx..."
-HOSTNAME=$(hostname -f 2>/dev/null || hostname)
 
+# nginx listens on APP_PORT externally; gunicorn runs on GUNICORN_PORT internally.
+# Using different ports avoids any self-proxy ambiguity.
 cat > "$NGINX_CONF" << EOF
-# PowerDNS Admin — available on port 9191
+# PowerDNS Admin — available on port ${APP_PORT}
 server {
-    listen 9191;
+    listen ${APP_PORT};
     server_name _;
 
     client_max_body_size 10m;
 
     location / {
-        proxy_pass         http://127.0.0.1:${APP_PORT};
+        proxy_pass         http://127.0.0.1:${GUNICORN_PORT};
         proxy_set_header   Host \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
         proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -257,7 +259,15 @@ server {
 }
 EOF
 
-nginx -t 2>/dev/null && nginx -s reload && ok "nginx configured" || warn "nginx reload failed — check config manually"
+# If nginx.conf doesn't already include conf.d, add the include to the http block.
+# Some setups (e.g., pure-proxy dns servers) omit the standard conf.d glob.
+if ! grep -q 'conf\.d/\*\.conf\|conf\.d/pdns-admin' /etc/nginx/nginx.conf 2>/dev/null; then
+    warn "nginx.conf does not include conf.d — adding explicit include"
+    sed -i "s|include[[:space:]]*/etc/nginx/mime\.types;|include /etc/nginx/mime.types;\n    include ${NGINX_CONF};|" /etc/nginx/nginx.conf
+fi
+
+nginx -t 2>/dev/null && nginx -s reload && ok "nginx configured (port ${APP_PORT} → gunicorn :${GUNICORN_PORT})" \
+    || warn "nginx reload failed — check /etc/nginx/nginx.conf manually"
 
 # ── Firewall ──────────────────────────────────────────────────────────────────
 
