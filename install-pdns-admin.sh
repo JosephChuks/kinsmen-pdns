@@ -172,6 +172,9 @@ SESSION_COOKIE_SAMESITE = 'Lax'
 
 # Captcha (disable to avoid requiring Redis/Memcached)
 CAPTCHA_ENABLE = False
+
+# SAML (disabled — not used)
+SAML_ENABLED = False
 PYEOF
 
 mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/data/flask_sessions"
