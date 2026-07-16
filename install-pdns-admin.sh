@@ -114,7 +114,11 @@ pip install -q --upgrade pip setuptools wheel
 # Strip pip option lines that old pip versions reject (e.g. --use-feature=no-binary-enable-wheel-cache)
 # PowerDNS-Admin's requirements.txt may contain these; they're hints not hard requirements.
 CLEANED_REQ=$(mktemp)
-grep -v '^--' "$INSTALL_DIR/requirements.txt" > "$CLEANED_REQ" || cp "$INSTALL_DIR/requirements.txt" "$CLEANED_REQ"
+# Strip pip option lines (old pip rejects them) and mysqlclient (needs MySQL dev
+# headers; we use SQLite so it's unused).
+grep -v '^--' "$INSTALL_DIR/requirements.txt" \
+    | grep -v '^mysqlclient' \
+    > "$CLEANED_REQ" || cp "$INSTALL_DIR/requirements.txt" "$CLEANED_REQ"
 
 # Install app dependencies
 pip install -q -r "$CLEANED_REQ" || pip install -r "$CLEANED_REQ"
