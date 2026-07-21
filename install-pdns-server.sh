@@ -56,7 +56,7 @@ PRIMARY_NS=""
 ADMIN_PORT=9191
 GUNICORN_PORT=9292
 INSTALL_DIR="/opt/pdns-admin"
-NGINX_CONF="/etc/nginx/conf.d/pdns-admin.conf"
+NGINX_CONF="/etc/nginx/nginx.conf"
 SECRET_FILE="/etc/pdns-admin.secret"
 PDNS_CONF="/etc/pdns/pdns.conf"
 DB_NAME="powerdns"
@@ -493,39 +493,808 @@ systemctl enable pdns-admin
 systemctl restart pdns-admin
 ok "pdns-admin service started"
 
-# ── 5. Nginx ──────────────────────────────────────────────────────────────────
+# ── 5. Nginx (DNS proxy + KP Shield + Admin UI) ───────────────────────────────
 
 hdr "Nginx"
 
-cat > "$NGINX_CONF" << EOF
-# PowerDNS Admin — port ${ADMIN_PORT} (nginx) → ${GUNICORN_PORT} (gunicorn)
-server {
-    listen ${ADMIN_PORT};
-    server_name _;
-    client_max_body_size 10m;
+# njs module (KP Shield)
+dnf install -y -q nginx-module-njs 2>/dev/null || \
+    dnf install -y -q nginx-mod-http-js 2>/dev/null || \
+    warn "nginx njs module not found — KP Shield will be inactive (install nginx-module-njs manually)"
 
-    location / {
-        proxy_pass         http://127.0.0.1:${GUNICORN_PORT};
-        proxy_set_header   Host \$host;
-        proxy_set_header   X-Real-IP \$remote_addr;
-        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 120s;
-    }
-}
-EOF
-
-# Some setups (e.g. pure-proxy dns servers) don't include conf.d — add include if missing
-if ! grep -q 'conf\.d/\*\.conf\|conf\.d/pdns-admin' /etc/nginx/nginx.conf 2>/dev/null; then
-    awk -v conf="$NGINX_CONF" '
-        /include.*mime\.types/ { print; print "    include " conf ";"; next }
-        { print }
-    ' /etc/nginx/nginx.conf > /tmp/nginx.conf.tmp && mv /tmp/nginx.conf.tmp /etc/nginx/nginx.conf
+# Generate shield HMAC secret
+if [[ ! -f /etc/nginx/kp_shield_secret ]]; then
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64 > /etc/nginx/kp_shield_secret
+    chmod 600 /etc/nginx/kp_shield_secret
 fi
 
+# Main nginx config — DNS proxy (port 80/443) + KP Shield + Admin UI (port 9191)
+cat > /etc/nginx/nginx.conf << 'NGINXEOF'
+load_module modules/ngx_http_js_module.so;
+
+user  nginx;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile      on;
+    keepalive_timeout 65;
+
+    map_hash_max_size   8192;
+    map_hash_bucket_size 128;
+
+    js_import kp_shield from /etc/nginx/kp_shield.js;
+
+    map $host $backend_80 {
+        include /etc/nginx/proxy_http_map.conf;
+        default "";
+    }
+
+    map $host $kp_shield_status {
+        include /etc/nginx/kp_shield_map.conf;
+    }
+
+    server {
+        listen 80 default_server;
+        server_name _;
+
+        error_page 502 503 504 /kp-down.html;
+
+        location = /kp-down.html {
+            root /var/www/kp-dns-error;
+            internal;
+            add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        }
+
+        # Shield verify endpoint (must be before the main proxy location)
+        location = /.kp-verify {
+            client_body_in_single_buffer on;
+            client_max_body_size 4k;
+            js_content kp_shield.verify;
+        }
+
+        # Internal auth-request check location
+        location = /_kp-check {
+            internal;
+            js_content kp_shield.check;
+        }
+
+        location / {
+            if ($backend_80 = "") {
+                return 503;
+            }
+
+            # Capture URI before auth_request subrequest changes $uri
+            set $kp_req_uri $request_uri;
+
+            auth_request      /_kp-check;
+            error_page 401  = @kp_challenge;
+            error_page 502 503 504 /kp-down.html;
+
+            proxy_pass         http://$backend_80;
+            proxy_http_version 1.1;
+            proxy_set_header   Connection        "";
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_connect_timeout 15s;
+            proxy_read_timeout    60s;
+            proxy_send_timeout    30s;
+        }
+
+        # Named location served when auth_request returns 401
+        location @kp_challenge {
+            js_content kp_shield.challenge;
+        }
+    }
+
+    # PowerDNS Admin UI
+    server {
+        listen 9191;
+        server_name _;
+        client_max_body_size 10m;
+
+        location / {
+            proxy_pass         http://127.0.0.1:GUNICORN_PORT_PLACEHOLDER;
+            proxy_set_header   Host $host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_read_timeout 120s;
+        }
+    }
+}
+
+stream {
+    map_hash_max_size   8192;
+    map_hash_bucket_size 128;
+
+    map $ssl_preread_server_name $backend_443 {
+        include /etc/nginx/proxy_stream_map.conf;
+        default "";
+    }
+
+    server {
+        listen 443;
+        proxy_pass $backend_443;
+        ssl_preread on;
+        proxy_protocol on;
+        proxy_connect_timeout 15s;
+        proxy_timeout 600s;
+    }
+}
+NGINXEOF
+
+# Substitute the actual gunicorn port (can't use variables inside 'EOF' heredoc)
+sed -i "s/GUNICORN_PORT_PLACEHOLDER/${GUNICORN_PORT}/" /etc/nginx/nginx.conf
+
+# KP Shield njs module
+cat > /etc/nginx/kp_shield.js << 'JSEOF'
+/**
+ * kp_shield.js — KP Bot Shield via nginx njs
+ *
+ * check(r)     — auth_request handler: 204 = allow, 401 = challenge needed
+ * challenge(r) — serve the PoW HTML challenge page (on 401)
+ * verify(r)    — handle POST solution, set cookie, redirect
+ *
+ * Map $host $kp_shield_status value format:  "difficulty:N"
+ * Cookie __kp_shield = <ts>.<hmac-sha256(secret, host:ts)>  — valid 24 h
+ */
+
+import crypto from 'crypto';
+import fs     from 'fs';
+
+var _secret = null;
+function getSecret() {
+    if (!_secret) {
+        try {
+            _secret = fs.readFileSync('/etc/nginx/kp_shield_secret', 'utf8').trim();
+        } catch (e) {
+            _secret = 'kp-shield-fallback-change-me';
+        }
+    }
+    return _secret;
+}
+
+var COOKIE_NAME   = '__kp_shield';
+var COOKIE_TTL    = 86400;   // 24 h
+var CHALLENGE_TTL = 300;     // 5 min
+
+function hmac(host, ts) {
+    return crypto.createHmac('sha256', getSecret())
+                 .update(host + ':' + ts)
+                 .digest('hex');
+}
+
+function getCookieValue(r) {
+    var raw = r.headersIn.cookie || '';
+    var re  = new RegExp('(?:^|;\\s*)' + COOKIE_NAME + '=([^;]+)');
+    var m   = raw.match(re);
+    return m ? decodeURIComponent(m[1]) : null;
+}
+
+function validateCookie(r, host) {
+    var val = getCookieValue(r);
+    if (!val) return false;
+    var dot = val.indexOf('.');
+    if (dot < 1) return false;
+    var ts  = val.slice(0, dot);
+    var sig = val.slice(dot + 1);
+    var now = Math.floor(Date.now() / 1000);
+    if (now - parseInt(ts, 10) > COOKIE_TTL) return false;
+    return sig === hmac(host, ts);
+}
+
+function issueCookie(r, host) {
+    var ts  = String(Math.floor(Date.now() / 1000));
+    var sig = hmac(host, ts);
+    var val = ts + '.' + sig;
+    var exp = new Date(Date.now() + COOKIE_TTL * 1000).toUTCString();
+    r.headersOut['Set-Cookie'] =
+        COOKIE_NAME + '=' + encodeURIComponent(val) +
+        '; Path=/; Expires=' + exp +
+        '; HttpOnly; SameSite=Lax';
+}
+
+function canonicalHost(r) {
+    return (r.headersIn.host || '').toLowerCase().replace(/:\d+$/, '');
+}
+
+function parseDifficulty(status) {
+    var m = (status || '').match(/difficulty:(\d+)/);
+    return m ? parseInt(m[1], 10) : 4;
+}
+
+// Returns null = whole site, or array of path prefixes to protect
+function parsePaths(status) {
+    var pipe = (status || '').indexOf('|');
+    if (pipe < 0) return null;
+    var parts = status.slice(pipe + 1).split('|');
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].trim();
+        if (p) out.push(p);
+    }
+    return out.length ? out : null;
+}
+
+// Strip query string from a URI
+function uriPath(uri) {
+    var q = uri.indexOf('?');
+    return q >= 0 ? uri.slice(0, q) : uri;
+}
+
+function parseQuery(str) {
+    var out = {};
+    var pairs = (str || '').split('&');
+    for (var i = 0; i < pairs.length; i++) {
+        var pair = pairs[i];
+        var eq = pair.indexOf('=');
+        if (eq > 0) {
+            try {
+                var k = decodeURIComponent(pair.slice(0, eq));
+                var v = decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, ' '));
+                out[k] = v;
+            } catch (_) {}
+        }
+    }
+    return out;
+}
+
+// ── check — auth_request handler ──────────────────────────────────────────────
+
+function check(r) {
+    var status = r.variables.kp_shield_status || '';
+    if (!status) { r.return(204); return; }
+
+    // Path-based protection: only block matching paths
+    var paths = parsePaths(status);
+    if (paths !== null) {
+        // $kp_req_uri is set in location / before auth_request fires
+        var reqPath = uriPath(r.variables.kp_req_uri || r.variables.request_uri || '/');
+        var matched = false;
+        for (var i = 0; i < paths.length; i++) {
+            if (reqPath === paths[i] || reqPath.indexOf(paths[i] + '/') === 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) { r.return(204); return; }
+    }
+
+    var host = canonicalHost(r);
+    if (validateCookie(r, host)) { r.return(204); return; }
+    r.return(401);
+}
+
+// ── challenge — serve PoW HTML ────────────────────────────────────────────────
+
+function challenge(r) {
+    var host       = canonicalHost(r);
+    var status     = r.variables.kp_shield_status || 'difficulty:4';
+    var difficulty = parseDifficulty(status);
+    // nginx generates a cryptographically random $request_id per-request
+    var seed = crypto.createHash('sha256').update(
+        (r.variables.request_id || '') + String(Date.now())
+    ).digest('hex').slice(0, 32);
+    var ts         = String(Math.floor(Date.now() / 1000));
+    var token      = crypto.createHash('sha256').update(seed + ts).digest('hex');
+    var returnTo   = encodeURIComponent(r.variables.request_uri || '/');
+
+    r.headersOut['Content-Type']  = 'text/html; charset=utf-8';
+    r.headersOut['Cache-Control'] = 'no-store';
+    r.headersOut['X-Robots-Tag']  = 'noindex';
+    r.return(200, buildPage(token, ts, seed, difficulty, returnTo, host));
+}
+
+// ── verify — handle PoW POST ──────────────────────────────────────────────────
+
+function verify(r) {
+    if (r.method !== 'POST') { r.return(405); return; }
+
+    var body  = parseQuery(r.requestText || '');
+    var token = body.token  || '';
+    var ts    = body.ts     || '';
+    var seed  = body.seed   || '';
+    var nonce = body.nonce  || '';
+    var ret   = body['return'] || '/';
+
+    var now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - parseInt(ts, 10)) > CHALLENGE_TTL) {
+        r.return(400, 'Challenge expired — please reload.');
+        return;
+    }
+
+    var expected = crypto.createHash('sha256').update(seed + ts).digest('hex');
+    if (token !== expected) {
+        r.return(400, 'Invalid challenge token.');
+        return;
+    }
+
+    var status     = r.variables.kp_shield_status || 'difficulty:4';
+    var difficulty = parseDifficulty(status);
+    var prefix     = '';
+    for (var i = 0; i < difficulty; i++) prefix += '0';
+
+    var pow = crypto.createHash('sha256').update(token + '.' + nonce).digest('hex');
+    if (pow.slice(0, difficulty) !== prefix) {
+        r.return(400, 'Proof-of-work failed.');
+        return;
+    }
+
+    var host = canonicalHost(r);
+    issueCookie(r, host);
+    r.headersOut['Location'] = ret.charAt(0) === '/' ? ret : '/';
+    r.return(302);
+}
+
+// ── HTML page ─────────────────────────────────────────────────────────────────
+
+function buildPage(token, ts, seed, difficulty, returnTo, host) {
+    var tokenJSON = JSON.stringify(token);
+    return '<!DOCTYPE html>\n' +
+'<html lang="en"><head>\n' +
+'<meta charset="utf-8">\n' +
+'<meta name="viewport" content="width=device-width,initial-scale=1">\n' +
+'<title>Security Check</title>\n' +
+'<style>\n' +
+'*{box-sizing:border-box;margin:0;padding:0}\n' +
+'body{font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;\n' +
+'     background:#0f172a;color:#e2e8f0;min-height:100vh;\n' +
+'     display:flex;align-items:center;justify-content:center}\n' +
+'.card{background:#1e293b;border:1px solid #334155;border-radius:16px;\n' +
+'      padding:40px 48px;max-width:420px;width:90%;text-align:center;\n' +
+'      box-shadow:0 25px 50px rgba(0,0,0,.5)}\n' +
+'.logo{font-size:42px;margin-bottom:16px}\n' +
+'h1{font-size:20px;font-weight:600;margin-bottom:8px;color:#f1f5f9}\n' +
+'p{font-size:14px;color:#94a3b8;margin-bottom:28px;line-height:1.5}\n' +
+'.spinner{width:48px;height:48px;border:4px solid #334155;\n' +
+'         border-top-color:#6366f1;border-radius:50%;\n' +
+'         animation:spin 0.8s linear infinite;margin:0 auto 20px}\n' +
+'@keyframes spin{to{transform:rotate(360deg)}}\n' +
+'.bar-wrap{background:#334155;border-radius:8px;height:6px;margin-bottom:16px;overflow:hidden}\n' +
+'.bar{height:100%;background:linear-gradient(90deg,#6366f1,#8b5cf6);\n' +
+'     border-radius:8px;width:0%;transition:width .3s ease}\n' +
+'.status{font-size:13px;color:#64748b;min-height:20px}\n' +
+'.host{font-size:12px;color:#475569;margin-top:24px;\n' +
+'      padding-top:16px;border-top:1px solid #334155}\n' +
+'.done{display:none}\n' +
+'.done .ck{font-size:48px;margin-bottom:12px}\n' +
+'.done h2{font-size:18px;font-weight:600;color:#4ade80}\n' +
+'</style></head><body>\n' +
+'<div class="card">\n' +
+'  <div class="logo">\u{1f6e1}️</div>\n' +
+'  <h1>Security Check</h1>\n' +
+'  <p>Verifying your browser.<br>This only takes a moment.</p>\n' +
+'  <div id="checking">\n' +
+'    <div class="spinner"></div>\n' +
+'    <div class="bar-wrap"><div class="bar" id="bar"></div></div>\n' +
+'    <div class="status" id="st">Initializing…</div>\n' +
+'  </div>\n' +
+'  <div class="done" id="done">\n' +
+'    <div class="ck">✅</div>\n' +
+'    <h2>Verified!</h2>\n' +
+'    <p style="color:#94a3b8;margin-top:8px">Redirecting…</p>\n' +
+'  </div>\n' +
+'  <div class="host">' + host + '</div>\n' +
+'  <form id="f" method="POST" action="/.kp-verify" style="display:none">\n' +
+'    <input name="token"  value="' + token + '">\n' +
+'    <input name="ts"     value="' + ts + '">\n' +
+'    <input name="seed"   value="' + seed + '">\n' +
+'    <input name="nonce"  id="nc" value="">\n' +
+'    <input name="return" value="' + decodeURIComponent(returnTo) + '">\n' +
+'  </form>\n' +
+'</div>\n' +
+'<script>\n' +
+'(async()=>{\n' +
+'  var token=' + tokenJSON + ';\n' +
+'  var diff=' + difficulty + ';\n' +
+'  var pfx="0".repeat(diff);\n' +
+'  var bar=document.getElementById("bar");\n' +
+'  var st=document.getElementById("st");\n' +
+'  async function sha256(s){\n' +
+'    var b=new TextEncoder().encode(s);\n' +
+'    var h=await crypto.subtle.digest("SHA-256",b);\n' +
+'    return Array.from(new Uint8Array(h)).map(x=>x.toString(16).padStart(2,"0")).join("");\n' +
+'  }\n' +
+'  st.textContent="Solving…";\n' +
+'  var n=0,avg=Math.pow(16,diff),start=Date.now();\n' +
+'  while(true){\n' +
+'    var h=await sha256(token+"."+n);\n' +
+'    if(h.startsWith(pfx))break;\n' +
+'    n++;\n' +
+'    var pct=Math.min(99,Math.round(n/avg*100));\n' +
+'    bar.style.width=pct+"%";\n' +
+'    if(n%500===0){\n' +
+'      var el=((Date.now()-start)/1000).toFixed(1);\n' +
+'      st.textContent="Working… ("+n.toLocaleString()+" attempts, "+el+"s)";\n' +
+'      await new Promise(r=>setTimeout(r,0));\n' +
+'    }\n' +
+'  }\n' +
+'  bar.style.width="100%";\n' +
+'  st.textContent="Done in "+n.toLocaleString()+" attempts!";\n' +
+'  document.getElementById("nc").value=n;\n' +
+'  document.getElementById("checking").style.display="none";\n' +
+'  document.getElementById("done").style.display="block";\n' +
+'  setTimeout(()=>document.getElementById("f").submit(),400);\n' +
+'})();\n' +
+'</script></body></html>';
+}
+
+export default { check: check, challenge: challenge, verify: verify };
+JSEOF
+
+# KP Shield domain map (populated by panel's kp-update-shield-map)
+cat > /etc/nginx/kp_shield_map.conf << 'EOF'
+# kp_shield_map.conf — auto-generated by kp-update-shield-map.sh
+# DO NOT EDIT MANUALLY — changes will be overwritten
+# Map $host => shield config string ("difficulty:N") or "" for no shield
+default "";
+EOF
+
+# Proxy maps — populated every minute by kp-update-proxy-map cron
+printf '# proxy_http_map.conf — auto-generated by kp-update-proxy-map\n' \
+    > /etc/nginx/proxy_http_map.conf
+printf '# proxy_stream_map.conf — auto-generated by kp-update-proxy-map\n' \
+    > /etc/nginx/proxy_stream_map.conf
+
+# API config for the proxy map cron script
+cat > /etc/nginx/kp_pdns_api.conf << EOF
+api_url=http://127.0.0.1:8081/api/v1/servers/localhost
+api_key=${API_KEY}
+EOF
+chmod 640 /etc/nginx/kp_pdns_api.conf
+ok "kp_pdns_api.conf written"
+
+# Custom error page (shown when origin is unreachable)
+mkdir -p /var/www/kp-dns-error
+cat > /var/www/kp-dns-error/kp-down.html << 'HTMLEOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Site Temporarily Unavailable</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:#0d1117;
+  color:#c9d1d9;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  min-height:100vh;
+  padding:2rem;
+}
+.card{
+  width:100%;
+  max-width:520px;
+  text-align:center;
+}
+.icon{
+  width:64px;height:64px;
+  margin:0 auto 1.5rem;
+  border-radius:50%;
+  background:#161b22;
+  border:2px solid #30363d;
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.8rem;
+}
+.code{
+  font-size:4rem;
+  font-weight:700;
+  color:#f0883e;
+  letter-spacing:-2px;
+  line-height:1;
+  margin-bottom:.5rem;
+}
+h1{
+  font-size:1.25rem;
+  font-weight:600;
+  color:#e6edf3;
+  margin-bottom:.75rem;
+}
+.desc{
+  font-size:.9rem;
+  color:#8b949e;
+  line-height:1.65;
+  margin-bottom:2rem;
+}
+.domain{
+  display:inline-block;
+  background:#161b22;
+  border:1px solid #30363d;
+  border-radius:6px;
+  padding:.25rem .75rem;
+  font-size:.8rem;
+  font-family:'SF Mono',Consolas,'Liberation Mono',Menlo,monospace;
+  color:#79c0ff;
+  margin-bottom:2rem;
+  max-width:100%;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.details{
+  display:flex;
+  gap:1rem;
+  justify-content:center;
+  flex-wrap:wrap;
+  margin-bottom:2.5rem;
+}
+.detail-item{
+  background:#161b22;
+  border:1px solid #30363d;
+  border-radius:8px;
+  padding:.6rem 1rem;
+  font-size:.78rem;
+  color:#8b949e;
+  text-align:left;
+  min-width:130px;
+}
+.detail-item strong{
+  display:block;
+  color:#c9d1d9;
+  font-size:.7rem;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  margin-bottom:.2rem;
+}
+.retry-btn{
+  display:inline-block;
+  padding:.6rem 1.5rem;
+  background:#238636;
+  color:#fff;
+  border:none;
+  border-radius:6px;
+  font-size:.875rem;
+  font-weight:500;
+  cursor:pointer;
+  text-decoration:none;
+  transition:background .2s;
+}
+.retry-btn:hover{background:#2ea043}
+footer{
+  position:fixed;
+  bottom:1.25rem;
+  font-size:.75rem;
+  color:#484f58;
+}
+footer a{color:#484f58;text-decoration:none}
+footer a:hover{color:#8b949e}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#x26A0;</div>
+  <div class="code" id="errcode">502</div>
+  <h1>This website is temporarily unavailable</h1>
+  <p class="desc">
+    The origin server did not respond in time.<br>
+    This is usually a temporary issue — please try again shortly.
+  </p>
+  <div class="domain" id="domain-label">loading&hellip;</div>
+  <div class="details">
+    <div class="detail-item">
+      <strong>Error</strong>
+      <span id="err-text">Bad Gateway</span>
+    </div>
+    <div class="detail-item">
+      <strong>Time</strong>
+      <span id="ts">—</span>
+    </div>
+    <div class="detail-item">
+      <strong>Ray</strong>
+      <span id="ray">—</span>
+    </div>
+  </div>
+  <a href="javascript:location.reload()" class="retry-btn">Try again</a>
+</div>
+<footer>Performance &amp; security by <a href="https://kinsmenwebpanel.com" target="_blank">Kinsmen Web Panel</a></footer>
+
+<script>
+(function(){
+  var host = location.hostname || 'unknown host';
+  document.getElementById('domain-label').textContent = host;
+  document.getElementById('ts').textContent = new Date().toUTCString().replace('GMT','UTC');
+
+  // Ray ID: short fingerprint of host + timestamp
+  var ray = (Date.now() ^ (host.split('').reduce(function(a,c){return (a<<5)-a+c.charCodeAt(0)|0},0))).toString(36).toUpperCase().slice(-8);
+  document.getElementById('ray').textContent = ray;
+})();
+</script>
+</body>
+</html>
+HTMLEOF
+ok "Error page installed at /var/www/kp-dns-error/kp-down.html"
+
+# Proxy map updater (runs every minute via cron)
+cat > /usr/local/sbin/kp-update-proxy-map << 'PYEOF'
+#!/usr/bin/env python3
+"""
+kp-update-proxy-map — Rebuild nginx proxy_http_map.conf and proxy_stream_map.conf
+from _kp-origin.* TXT records in local PowerDNS.
+
+Runs every minute via cron on dns1 and dns2.
+TXT record format:  _kp-origin.<domain>  →  "origin_ip"
+
+HTTP map  → domain maps to bare IP  (nginx uses :80 by default)
+Stream map → domain maps to IP:10443 (origin nginx PROXY-protocol HTTPS port)
+"""
+import json, os, re, subprocess, sys, urllib.request, urllib.parse
+from datetime import datetime
+
+HTTP_MAP    = '/etc/nginx/proxy_http_map.conf'
+STREAM_MAP  = '/etc/nginx/proxy_stream_map.conf'
+PDNS_CONF   = '/etc/nginx/kp_pdns_api.conf'
+LOG         = '/var/log/kp-proxy-map.log'
+
+
+def read_conf(path):
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                k, _, v = line.partition('=')
+                cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def pdns_get(url_base, key, path):
+    url = url_base.rstrip('/') + path
+    req = urllib.request.Request(url, headers={'X-API-Key': key, 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r) if r.status == 200 else None
+    except Exception:
+        return None
+
+
+def write_if_changed(path, entries, label):
+    ts   = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    body = f'# {label} — auto-generated {ts}\n# DO NOT EDIT MANUALLY\n'
+    for host, val in sorted(entries.items()):
+        body += f'  {host} {val};\n'
+
+    norm = lambda s: re.sub(r'auto-generated [^\n]+\n', '', s)
+    try:
+        existing = open(path).read()
+    except FileNotFoundError:
+        existing = ''
+
+    if norm(body) == norm(existing):
+        return False
+
+    with open(path, 'w') as f:
+        f.write(body)
+    return True
+
+
+def log(msg):
+    ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(LOG, 'a') as f:
+            f.write(f'[{ts}] {msg}\n')
+    except Exception:
+        pass
+
+
+def main():
+    if not os.path.exists(PDNS_CONF):
+        sys.exit(0)
+
+    cfg     = read_conf(PDNS_CONF)
+    api_url = cfg.get('api_url', '').rstrip('/')
+    api_key = cfg.get('api_key', '')
+    if not api_url or not api_key:
+        sys.exit(0)
+
+    zones = pdns_get(api_url, api_key, '/zones')
+    if not isinstance(zones, list):
+        sys.exit(0)
+
+    http_map   = {}
+    stream_map = {}
+
+    for zone in zones:
+        zone_id   = zone.get('id', '')
+        zone_name = zone.get('name', '').rstrip('.')
+        if not zone_id or not zone_name:
+            continue
+
+        detail = pdns_get(
+            api_url, api_key,
+            f'/zones/{urllib.parse.quote(zone_id, safe="")}?rrsets=true'
+        )
+        if not isinstance(detail, dict):
+            continue
+
+        rrsets = detail.get('rrsets', [])
+
+        # Find _kp-origin.<zone> TXT → origin IP
+        origin_ip = None
+        for rr in rrsets:
+            if rr.get('type') != 'TXT':
+                continue
+            name = rr.get('name', '')
+            if not re.match(rf'^_kp-origin\.{re.escape(zone_name)}\.$', name):
+                continue
+            for rec in rr.get('records', []):
+                v = rec.get('content', '').strip('"')
+                if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}$', v):
+                    origin_ip = v
+                    break
+            if origin_ip:
+                break
+
+        if not origin_ip:
+            continue
+
+        # Zone apex + www
+        for host in (zone_name, f'www.{zone_name}'):
+            http_map[host]   = origin_ip
+            stream_map[host] = f'{origin_ip}:10443'
+
+        # Any A records in this zone that point to the same origin
+        for rr in rrsets:
+            if rr.get('type') != 'A':
+                continue
+            host = rr.get('name', '').rstrip('.')
+            if host in (zone_name, f'www.{zone_name}'):
+                continue
+            for rec in rr.get('records', []):
+                if rec.get('content', '') == origin_ip:
+                    http_map[host]   = origin_ip
+                    stream_map[host] = f'{origin_ip}:10443'
+                    break
+
+    if not http_map:
+        sys.exit(0)
+
+    h_changed = write_if_changed(HTTP_MAP,   http_map,   'proxy_http_map.conf')
+    s_changed = write_if_changed(STREAM_MAP, stream_map, 'proxy_stream_map.conf')
+
+    if h_changed or s_changed:
+        r = subprocess.run(
+            ['systemctl', 'reload', 'nginx'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if r.returncode != 0:
+            log(f'nginx reload failed: {r.stderr.decode().strip()}')
+        else:
+            log(f'Maps updated: {len(http_map)} domains, nginx reloaded.')
+
+
+main()
+PYEOF
+chmod +x /usr/local/sbin/kp-update-proxy-map
+ok "kp-update-proxy-map installed"
+
+# Cron: refresh proxy maps every minute
+(crontab -l 2>/dev/null | grep -v kp-update-proxy-map; \
+ echo "* * * * * /usr/local/sbin/kp-update-proxy-map >> /var/log/kp-proxy-map.log 2>&1") | crontab -
+ok "Proxy map cron installed (every minute)"
+
 systemctl enable nginx
-nginx -t 2>/dev/null && systemctl reload nginx || systemctl start nginx
-ok "nginx configured — Admin UI on port ${ADMIN_PORT}"
+nginx -t && systemctl reload nginx 2>/dev/null || systemctl start nginx
+ok "nginx configured — proxy on 80/443, Admin UI on port ${ADMIN_PORT}"
 
 # ── 6. Firewall ───────────────────────────────────────────────────────────────
 
@@ -533,12 +1302,14 @@ hdr "Firewall"
 
 if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
     firewall-cmd --permanent --add-service=dns  &>/dev/null
+    firewall-cmd --permanent --add-service=http &>/dev/null
+    firewall-cmd --permanent --add-service=https &>/dev/null
     firewall-cmd --permanent --add-port=8081/tcp &>/dev/null
     firewall-cmd --permanent --add-port="${ADMIN_PORT}/tcp" &>/dev/null
     firewall-cmd --reload &>/dev/null
-    ok "Firewall: ports 53, 8081, ${ADMIN_PORT} opened"
+    ok "Firewall: ports 53, 80, 443, 8081, ${ADMIN_PORT} opened"
 else
-    warn "No firewall-cmd found — ensure ports 53 (UDP+TCP), 8081, ${ADMIN_PORT} are reachable"
+    warn "No firewall-cmd found — ensure ports 53 (UDP+TCP), 80, 443, 8081, ${ADMIN_PORT} are reachable"
 fi
 
 # ── 7. First-run admin account ────────────────────────────────────────────────
