@@ -1252,7 +1252,8 @@ def main():
             http_map[host]   = origin_ip
             stream_map[host] = f'{origin_ip}:10443'
 
-        # Any A records in this zone that point to the same origin
+        # Any A records pointing to the origin IP (stock subdomains) OR proxy IPs (custom subdomains)
+        PROXY_IPS = {'162.35.105.61', '46.183.27.159'}
         for rr in rrsets:
             if rr.get('type') != 'A':
                 continue
@@ -1260,7 +1261,8 @@ def main():
             if host in (zone_name, f'www.{zone_name}'):
                 continue
             for rec in rr.get('records', []):
-                if rec.get('content', '') == origin_ip:
+                content = rec.get('content', '')
+                if content == origin_ip or content in PROXY_IPS:
                     http_map[host]   = origin_ip
                     stream_map[host] = f'{origin_ip}:10443'
                     break
