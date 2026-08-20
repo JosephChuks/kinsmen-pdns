@@ -62,9 +62,10 @@ ok "PowerDNS API reachable"
 # ── System dependencies ───────────────────────────────────────────────────────
 
 info "Installing system dependencies..."
-# Prefer python3.9 (available on EL8 via appstream); python3 on EL8 is 3.6 which
-# is too old for PowerDNS-Admin and has a pip that lacks required features.
-dnf install -y -q python39 python39-devel python39-pip 2>/dev/null || true
+# PowerDNS-Admin's recent deps require Python >=3.10 (Authlib, cffi, dnspython).
+# Install python3.11 (available in EL8 appstream) — falls back to 3.9 if unavailable.
+dnf install -y -q python3.11 python3.11-devel 2>/dev/null || \
+    dnf install -y -q python39 python39-devel python39-pip 2>/dev/null || true
 
 # Node 18+ required by PowerDNS-Admin's frontend deps (fs-extra requires >=12,
 # default EL8 stream is Node 10). Switch module stream before installing.
@@ -88,8 +89,9 @@ dnf install -y -q \
     sqlite git curl \
     nodejs npm
 
-# yarn via npm
-npm install -g yarn --quiet 2>/dev/null || true
+# Enable corepack so Node can manage yarn versions per-project (needed for yarn 4/berry).
+# Yarn 4 is specified via "packageManager" in PowerDNS-Admin's package.json.
+corepack enable 2>/dev/null || npm install -g yarn --quiet 2>/dev/null || true
 ok "Dependencies installed (Node $(node --version 2>/dev/null))"
 
 # ── Service user ──────────────────────────────────────────────────────────────
@@ -113,8 +115,9 @@ ok "Source ready at $INSTALL_DIR"
 # ── Python virtual environment ────────────────────────────────────────────────
 
 info "Setting up Python environment..."
-# Use python3.9 if available (EL8 ships python3=3.6 which is too old)
-PYTHON_BIN=$(command -v python3.9 || command -v python3.8 || command -v python3)
+# Prefer python3.11+ — PowerDNS-Admin's recent deps (Authlib, cffi, dnspython) require >=3.10.
+# EL8: python3.11 is available from appstream: dnf install python3.11 python3.11-devel
+PYTHON_BIN=$(command -v python3.11 || command -v python3.10 || command -v python3.9 || command -v python3.8 || command -v python3)
 info "Using $($PYTHON_BIN --version 2>&1)"
 "$PYTHON_BIN" -m venv "$INSTALL_DIR/venv"
 source "$INSTALL_DIR/venv/bin/activate"
@@ -127,9 +130,12 @@ pip install -q --upgrade pip setuptools wheel
 CLEANED_REQ=$(mktemp)
 # Strip pip option lines (old pip rejects them) and mysqlclient (needs MySQL dev
 # headers; we use SQLite so it's unused).
+# Also downgrade Authlib: >=1.7.0 requires Python 3.10+; pin to 1.6.x for EL8 (Python 3.9).
 grep -v '^--' "$INSTALL_DIR/requirements.txt" \
     | grep -v '^mysqlclient' \
     | grep -v '^psycopg2' \
+    | sed 's/^Authlib==1\.[7-9]\.[0-9]*/Authlib==1.6.12/' \
+    | sed 's/^cffi==2\.[1-9]\.[0-9]*/cffi==2.0.0/' \
     > "$CLEANED_REQ" || cp "$INSTALL_DIR/requirements.txt" "$CLEANED_REQ"
 
 # Install app dependencies
@@ -194,7 +200,16 @@ ok "App configured"
 
 info "Building frontend assets (this may take a minute)..."
 cd "$INSTALL_DIR"
-if command -v yarn &>/dev/null; then
+# Use corepack yarn if the project pins yarn 4+ (requires corepack enable above).
+# Detect required yarn major version from package.json; fall back to npm if < 4 or unset.
+_YARN_REQ=$(python3 -c "import json; d=json.load(open('package.json')); pm=d.get('packageManager',''); print(pm.split('@')[1].split('.')[0] if 'yarn' in pm else '0')" 2>/dev/null || echo "0")
+if [[ "${_YARN_REQ:-0}" -ge 4 ]] && command -v corepack &>/dev/null; then
+    # Yarn 4 defaults to PnP mode; force node-modules linker so Flask-Assets can find packages
+    [[ ! -f "$INSTALL_DIR/.yarnrc.yml" ]] && echo 'nodeLinker: node-modules' > "$INSTALL_DIR/.yarnrc.yml"
+    grep -q 'nodeLinker' "$INSTALL_DIR/.yarnrc.yml" || echo 'nodeLinker: node-modules' >> "$INSTALL_DIR/.yarnrc.yml"
+    corepack yarn install 2>&1 | tail -10
+    # No separate build step — Flask-Assets serves directly from node_modules
+elif command -v yarn &>/dev/null && [[ "${_YARN_REQ:-0}" -lt 4 ]]; then
     yarn install 2>&1 | tail -5
     yarn build 2>&1 | tail -10
 else
