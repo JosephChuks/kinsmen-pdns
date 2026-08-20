@@ -208,6 +208,8 @@ if [[ "${_YARN_REQ:-0}" -ge 4 ]] && command -v corepack &>/dev/null; then
     [[ ! -f "$INSTALL_DIR/.yarnrc.yml" ]] && echo 'nodeLinker: node-modules' > "$INSTALL_DIR/.yarnrc.yml"
     grep -q 'nodeLinker' "$INSTALL_DIR/.yarnrc.yml" || echo 'nodeLinker: node-modules' >> "$INSTALL_DIR/.yarnrc.yml"
     corepack yarn install 2>&1 | tail -10
+    # Flask-Assets expects node_modules at powerdnsadmin/static/node_modules — symlink it
+    ln -sfn "$INSTALL_DIR/node_modules" "$INSTALL_DIR/powerdnsadmin/static/node_modules"
     # No separate build step — Flask-Assets serves directly from node_modules
 elif command -v yarn &>/dev/null && [[ "${_YARN_REQ:-0}" -lt 4 ]]; then
     yarn install 2>&1 | tail -5
