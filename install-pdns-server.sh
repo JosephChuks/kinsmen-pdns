@@ -339,6 +339,12 @@ EOF
         2>/dev/null && ok "Primary ${PRIMARY_IP} registered as supermaster"
 fi
 
+# pdns.service runs as User=pdns/Group=pdns (see the unit file) — the config
+# must be readable by that user, not just root, or pdns_server fails at
+# startup with "Unable to open pdns.conf" / "no backends configured".
+chown root:pdns "$PDNS_CONF" 2>/dev/null || true
+chmod 640 "$PDNS_CONF"
+
 systemctl daemon-reload
 systemctl enable pdns
 systemctl restart pdns
