@@ -252,6 +252,13 @@ ok "MariaDB ready — database '${DB_NAME}' created"
 
 hdr "PowerDNS"
 
+# The pdns/pdns-backend-mysql RPMs from the official repo pull in libsodium
+# and luajit, which live in EPEL (and, on EL8, need PowerTools/CRB enabled
+# for some of EPEL's own deps) — not in the base AppStream/BaseOS repos.
+dnf install -y -q epel-release 2>/dev/null || dnf install -y epel-release 2>/dev/null || true
+dnf config-manager --set-enabled powertools 2>/dev/null || true
+dnf config-manager --set-enabled crb 2>/dev/null || true
+
 # Try official repo first, fall back to distro
 curl -fsSL https://repo.powerdns.com/repo-files/el-auth-49.repo \
     -o /etc/yum.repos.d/pdns.repo 2>/dev/null || warn "Official PowerDNS repo unavailable — using distro packages"
