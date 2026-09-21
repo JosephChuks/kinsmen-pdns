@@ -95,8 +95,13 @@ die()  { echo -e "${RED}✗${NC}  $*" >&2; exit 1; }
 hdr()  { echo -e "\n${BOLD}${CYAN}── $* ──${NC}"; }
 
 # Generate secrets if not provided
-[[ -z "$API_KEY" ]] && API_KEY=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40)
-[[ -z "$DB_PASS" ]] && DB_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+# `head -c N` closes its stdin pipe once it has enough bytes, which SIGPIPEs
+# the upstream `tr` reading from /dev/urandom — under `set -o pipefail` that
+# makes the whole pipeline "fail" and set -e kills the script right here,
+# silently. `|| true` on the substitution neutralizes that; nothing else in
+# these lines can meaningfully fail.
+[[ -z "$API_KEY" ]] && { API_KEY=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 40) || true; }
+[[ -z "$DB_PASS" ]] && { DB_PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32) || true; }
 
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
@@ -504,7 +509,7 @@ dnf install -y -q nginx-module-njs 2>/dev/null || \
 
 # Generate shield HMAC secret
 if [[ ! -f /etc/nginx/kp_shield_secret ]]; then
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64 > /etc/nginx/kp_shield_secret
+    { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 64 > /etc/nginx/kp_shield_secret; } || true
     chmod 600 /etc/nginx/kp_shield_secret
 fi
 

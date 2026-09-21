@@ -37,7 +37,9 @@ die()  { echo -e "${RED}✗${NC}  $*" >&2; exit 1; }
 
 # Generate API key if not provided
 if [[ -z "$API_KEY" ]]; then
-    API_KEY=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)
+    # `head -c N` SIGPIPEs the upstream `tr`; under pipefail+set -e that would
+    # silently kill the script here — `|| true` neutralizes it.
+    API_KEY=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32) || true
     warn "No --api-key given — generated: $API_KEY"
     warn "Save this key — it won't be shown again"
 fi
@@ -76,7 +78,7 @@ CREATE TABLE IF NOT EXISTS domains (
   last_check            INTEGER DEFAULT NULL,
   type                  VARCHAR(8) NOT NULL,
   notified_serial       INTEGER DEFAULT NULL,
-  account               VARCHAR(40) CHARACTER SET 'utf8' DEFAULT NULL,
+  account               VARCHAR(40) DEFAULT NULL,
   options               VARCHAR(65535) DEFAULT NULL,
   catalog               VARCHAR(255) DEFAULT NULL
 );
@@ -190,6 +192,8 @@ loglevel=3
 disable-axfr=no
 EOF
 
+chown root:pdns "$PDNS_CONF" 2>/dev/null || true
+chmod 640 "$PDNS_CONF"
 ok "Configuration written"
 
 # ── Enable and start ──────────────────────────────────────────────────────────
