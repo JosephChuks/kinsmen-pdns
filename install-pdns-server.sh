@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS domains (
   type                  VARCHAR(8) NOT NULL,
   notified_serial       BIGINT DEFAULT NULL,
   account               VARCHAR(40) CHARACTER SET 'utf8' DEFAULT NULL,
-  options               VARCHAR(65535) DEFAULT NULL,
+  options               TEXT DEFAULT NULL,
   catalog               VARCHAR(255) DEFAULT NULL,
   PRIMARY KEY (id)
 ) Engine=InnoDB CHARACTER SET 'latin1';
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS records (
   domain_id             INT DEFAULT NULL,
   name                  VARCHAR(255) DEFAULT NULL,
   type                  VARCHAR(10) DEFAULT NULL,
-  content               VARCHAR(65535) DEFAULT NULL,
+  content               TEXT DEFAULT NULL,
   ttl                   INT DEFAULT NULL,
   prio                  INT DEFAULT NULL,
   disabled              TINYINT(1) DEFAULT 0,
