@@ -160,9 +160,15 @@ systemctl start mariadb
 sleep 2
 
 mysql -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8;" 2>/dev/null
-mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || \
-mysql -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || true
-mysql -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';" 2>/dev/null
+# pdns.conf connects via gmysql-host=127.0.0.1 (TCP), which MySQL/MariaDB
+# treats as a DIFFERENT grant host than 'localhost' (socket-only) — a
+# localhost-only grant leaves pdns_server unable to authenticate at all,
+# failing with a misleading "(13)" connect error. Grant both.
+for _host in 'localhost' '127.0.0.1'; do
+    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'${_host}' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || \
+    mysql -e "ALTER USER '${DB_USER}'@'${_host}' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || true
+    mysql -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'${_host}';" 2>/dev/null
+done
 mysql -e "FLUSH PRIVILEGES;" 2>/dev/null
 
 # PowerDNS MySQL schema
