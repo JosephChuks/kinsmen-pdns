@@ -1314,7 +1314,9 @@ chmod +x /usr/local/sbin/kp-update-proxy-map
 ok "kp-update-proxy-map installed"
 
 # Cron: refresh proxy maps every minute
-(crontab -l 2>/dev/null | grep -v kp-update-proxy-map; \
+# grep -v exits 1 when it filters everything out (e.g. an empty/fresh
+# crontab) — under pipefail that would kill the script right here, so `|| true`.
+(crontab -l 2>/dev/null | grep -v kp-update-proxy-map || true; \
  echo "* * * * * /usr/local/sbin/kp-update-proxy-map >> /var/log/kp-proxy-map.log 2>&1") | crontab -
 ok "Proxy map cron installed (every minute)"
 
