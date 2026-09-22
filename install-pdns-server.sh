@@ -165,7 +165,15 @@ mysql -e "CREATE DATABASE IF NOT EXISTS ${DB_NAME} CHARACTER SET utf8;" 2>/dev/n
 # localhost-only grant leaves pdns_server unable to authenticate at all,
 # failing with a misleading "(13)" connect error. Grant both.
 for _host in 'localhost' '127.0.0.1'; do
-    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'${_host}' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || \
+    # CREATE USER IF NOT EXISTS is a no-op when the user already exists (e.g.
+    # a re-run after a partial/failed install) — it does NOT update the
+    # password. DB_PASS is freshly randomly-generated every run (see above),
+    # so on a re-run the MySQL user was silently left with its OLD password
+    # while pdns.conf got the NEW one, causing pdns_server to fail with
+    # "Access denied for user 'pdns'@'localhost'" even though everything
+    # else installed fine. Always run ALTER USER afterward, unconditionally,
+    # so the password is synced to DB_PASS whether the user is new or not.
+    mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'${_host}' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || true
     mysql -e "ALTER USER '${DB_USER}'@'${_host}' IDENTIFIED BY '${DB_PASS}';" 2>/dev/null || true
     mysql -e "GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'${_host}';" 2>/dev/null
 done
